@@ -1,0 +1,155 @@
+@page "/upload"
+@rendermode InteractiveServer
+@inject AppDbContext Db
+@inject NavigationManager Nav
+@inject IHttpContextAccessor HttpCtx
+@inject IConfiguration Config
+@inject JobQueueService Queue
+@inject AuditService Audit
+
+<PageTitle>رفع وثيقة</PageTitle>
+
+@if (!_authenticated) { <p>جارٍ التحقق...</p> return; }
+
+<div class="row justify-content-center">
+    <div class="col-md-8">
+        <div class="card shadow-sm">
+            <div class="card-header">
+                <h6 class="mb-0"><i class="bi bi-cloud-upload me-2"></i>رفع وثيقة جديدة</h6>
+            </div>
+            <div class="card-body">
+                @if (!string.IsNullOrEmpty(_successMsg))
+                {
+                    <div class="alert alert-success">
+                        <i class="bi bi-check-circle me-1"></i>@_successMsg
+                        <a href="/jobs/@_newJobId" class="btn btn-sm btn-success ms-2">عرض الوثيقة</a>
+                    </div>
+                }
+                @if (!string.IsNullOrEmpty(_error))
+                {
+                    <div class="alert alert-danger">
+                        <i class="bi bi-exclamation-triangle me-1"></i>@_error
+                    </div>
+                }
+
+                <InputFile OnChange="HandleFileSelected" accept=".jpg,.jpeg,.png,.pdf,.tif,.tiff"
+                           class="form-control mb-3" multiple="false" />
+
+                @if (_selectedFile != null)
+                {
+                    <div class="alert alert-info py-2">
+                        <i class="bi bi-file-earmark me-1"></i>
+                        <strong>@_selectedFile.Name</strong>
+                        <span class="text-muted ms-2">(@FormatSize(_selectedFile.Size))</span>
+                    </div>
+                }
+
+                <div class="d-flex gap-2">
+                    <button class="btn btn-primary" @onclick="UploadAsync" disabled="@(_selectedFile == null || _uploading)">
+                        @if (_uploading)
+                        {
+                            <span class="spinner-border spinner-border-sm me-1"></span>
+                            <span>جارٍ الرفع...</span>
+                        }
+                        else
+                        {
+                            <i class="bi bi-cloud-upload me-1"></i>
+                            <span>رفع وبدء المعالجة</span>
+                        }
+                    </button>
+                    <a href="/jobs" class="btn btn-outline-secondary">إلغاء</a>
+                </div>
+            </div>
+            <div class="card-footer text-muted small">
+                <i class="bi bi-info-circle me-1"></i>
+                الأنواع المقبولة: PDF، JPG، PNG، TIFF — الحد الأقصى: 50 MB
+            </div>
+        </div>
+    </div>
+</div>
+
+@code {
+    private bool _authenticated;
+    private IBrowserFile? _selectedFile;
+    private bool _uploading;
+    private string? _error;
+    private string? _successMsg;
+    private int _newJobId;
+
+    private static readonly string[] AllowedExts = [".jpg", ".jpeg", ".png", ".pdf", ".tif", ".tiff"];
+    private static readonly string[] AllowedMimes = ["image/jpeg", "image/png", "image/tiff", "application/pdf"];
+
+    protected override void OnInitialized()
+    {
+        var username = HttpCtx.HttpContext?.Session.GetString("username");
+        if (string.IsNullOrEmpty(username)) Nav.NavigateTo("/login", true);
+        else _authenticated = true;
+    }
+
+    private void HandleFileSelected(InputFileChangeEventArgs e) => _selectedFile = e.File;
+
+    private async Task UploadAsync()
+    {
+        if (_selectedFile == null) return;
+        _error = null; _successMsg = null;
+
+        var ext = Path.GetExtension(_selectedFile.Name).ToLowerInvariant();
+        if (!AllowedExts.Contains(ext)) { _error = "نوع الملف غير مدعوم."; return; }
+        if (!AllowedMimes.Contains(_selectedFile.ContentType)) { _error = "نوع MIME غير مسموح."; return; }
+
+        const long MaxSize = 50L * 1024 * 1024;
+        if (_selectedFile.Size > MaxSize) { _error = "حجم الملف يتجاوز 50 ميجابايت."; return; }
+
+        _uploading = true;
+
+        var uploadsDir = Environment.GetEnvironmentVariable("UPLOADS_DIR")
+            ?? Path.Combine(AppContext.BaseDirectory, "uploads");
+        Directory.CreateDirectory(uploadsDir);
+
+        var stored = $"{Guid.NewGuid():N}{ext}";
+        var filePath = Path.Combine(uploadsDir, stored);
+
+        try
+        {
+            await using var fs = File.Create(filePath);
+            await using var stream = _selectedFile.OpenReadStream(MaxSize);
+            await stream.CopyToAsync(fs);
+
+            var userId = int.Parse(HttpCtx.HttpContext!.Session.GetString("userId")!);
+            var username = HttpCtx.HttpContext.Session.GetString("username");
+
+            var job = new Job
+            {
+                UserId = userId,
+                Filename = stored,
+                OriginalFilename = _selectedFile.Name,
+                FileType = ext.TrimStart('.'),
+                FileSize = _selectedFile.Size,
+                Status = "pending",
+                CreatedAt = DateTime.UtcNow,
+                UpdatedAt = DateTime.UtcNow
+            };
+
+            Db.Jobs.Add(job);
+            await Db.SaveChangesAsync();
+            _newJobId = job.Id;
+
+            await Audit.LogAsync(userId, username, "JOB_CREATED", "job", job.Id,
+                $"رُفع الملف: {_selectedFile.Name}");
+
+            Queue.EnqueueJob(job.Id);
+
+            _successMsg = $"تم رفع الملف بنجاح وبدأت معالجة OCR تلقائياً.";
+            _selectedFile = null;
+        }
+        catch (Exception ex)
+        {
+            _error = $"فشل الرفع: {ex.Message}";
+            if (File.Exists(filePath)) File.Delete(filePath);
+        }
+        finally { _uploading = false; }
+    }
+
+    static string FormatSize(long bytes) => bytes < 1024 * 1024
+        ? $"{bytes / 1024} KB" : $"{bytes / 1024 / 1024:F1} MB";
+}
