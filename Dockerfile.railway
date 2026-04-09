@@ -1,0 +1,108 @@
+# ============================================================
+# دارة الملك عبدالعزيز — OCR Platform
+# Dockerfile موحد لـ Railway
+# يشغّل: Nginx (واجهة + reverse proxy) + Node.js API في حاوية واحدة
+# ============================================================
+
+# ── Stage 1: بناء الواجهة الأمامية ──────────────────────────
+FROM node:24-slim AS frontend-builder
+WORKDIR /app
+
+RUN corepack enable && corepack prepare pnpm@10.26.1 --activate
+
+COPY package.json pnpm-workspace.yaml pnpm-lock.yaml ./
+COPY artifacts/api-server/package.json         ./artifacts/api-server/
+COPY artifacts/ocr-dashboard/package.json      ./artifacts/ocr-dashboard/
+COPY artifacts/mockup-sandbox/package.json     ./artifacts/mockup-sandbox/
+COPY lib/db/package.json                       ./lib/db/
+COPY lib/api-spec/package.json                 ./lib/api-spec/
+COPY lib/api-zod/package.json                  ./lib/api-zod/
+COPY lib/api-client-react/package.json         ./lib/api-client-react/
+COPY lib/integrations-gemini-ai/package.json   ./lib/integrations-gemini-ai/
+COPY lib/integrations/gemini_ai_integrations/package.json \
+     ./lib/integrations/gemini_ai_integrations/
+
+RUN pnpm install --frozen-lockfile
+
+COPY . .
+
+ENV PORT=3000
+ENV BASE_PATH=/
+ENV NODE_ENV=production
+
+RUN pnpm --filter @workspace/ocr-dashboard run build
+
+# ── Stage 2: بناء الـ API ────────────────────────────────────
+FROM node:24-slim AS api-builder
+WORKDIR /app
+
+RUN corepack enable && corepack prepare pnpm@10.26.1 --activate
+
+COPY package.json pnpm-workspace.yaml pnpm-lock.yaml ./
+COPY artifacts/api-server/package.json         ./artifacts/api-server/
+COPY artifacts/ocr-dashboard/package.json      ./artifacts/ocr-dashboard/
+COPY artifacts/mockup-sandbox/package.json     ./artifacts/mockup-sandbox/
+COPY lib/db/package.json                       ./lib/db/
+COPY lib/api-spec/package.json                 ./lib/api-spec/
+COPY lib/api-zod/package.json                  ./lib/api-zod/
+COPY lib/api-client-react/package.json         ./lib/api-client-react/
+COPY lib/integrations-gemini-ai/package.json   ./lib/integrations-gemini-ai/
+COPY lib/integrations/gemini_ai_integrations/package.json \
+     ./lib/integrations/gemini_ai_integrations/
+
+RUN pnpm install --frozen-lockfile
+
+COPY . .
+
+RUN pnpm --filter @workspace/api-server run build
+
+# ── Stage 3: صورة الإنتاج النهائية ──────────────────────────
+FROM node:24-slim AS production
+WORKDIR /app
+
+# تثبيت أدوات النظام: Nginx + أدوات OCR
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    nginx \
+    poppler-utils \
+    ghostscript \
+    imagemagick \
+    ca-certificates \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# السماح لـ ImageMagick بقراءة ملفات PDF
+RUN sed -i 's|<policy domain="coder" rights="none" pattern="PDF" />|<policy domain="coder" rights="read|write" pattern="PDF" />|g' \
+    /etc/ImageMagick-6/policy.xml 2>/dev/null || true
+
+# تفعيل pnpm
+RUN corepack enable && corepack prepare pnpm@10.26.1 --activate
+
+# نسخ الواجهة المبنية
+COPY --from=frontend-builder /app/artifacts/ocr-dashboard/dist/public /usr/share/nginx/html
+
+# نسخ API المبني
+COPY --from=api-builder /app/artifacts/api-server/dist ./artifacts/api-server/dist
+COPY --from=api-builder /app/node_modules ./node_modules
+COPY --from=api-builder /app/lib/db ./lib/db
+COPY --from=api-builder /app/package.json ./
+COPY --from=api-builder /app/pnpm-workspace.yaml ./
+
+# نسخ إعدادات Nginx
+COPY nginx/railway.conf /etc/nginx/conf.d/default.conf
+RUN rm -f /etc/nginx/sites-enabled/default
+
+# إنشاء مجلد الملفات المرفوعة
+RUN mkdir -p /data/uploads
+
+# سكريبت البداية
+COPY scripts/railway-start.sh /start.sh
+RUN chmod +x /start.sh
+
+ENV NODE_ENV=production
+ENV PORT=8080
+ENV API_INTERNAL_PORT=3000
+ENV UPLOADS_DIR=/data/uploads
+
+EXPOSE 8080
+
+CMD ["/start.sh"]
