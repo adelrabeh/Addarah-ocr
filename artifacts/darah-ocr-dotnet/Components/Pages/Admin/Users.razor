@@ -1,0 +1,216 @@
+@page "/admin/users"
+@rendermode InteractiveServer
+@inject AppDbContext Db
+@inject AuthService AuthSvc
+@inject AuditService Audit
+@inject NavigationManager Nav
+@inject IHttpContextAccessor HttpCtx
+
+<PageTitle>إدارة المستخدمين</PageTitle>
+
+@if (!_authenticated) { return; }
+
+<div class="d-flex justify-content-between align-items-center mb-3">
+    <h5 class="mb-0"><i class="bi bi-people me-2"></i>إدارة المستخدمين</h5>
+    <button class="btn btn-primary btn-sm" @onclick='() => _showCreate = true'>
+        <i class="bi bi-person-plus me-1"></i>مستخدم جديد
+    </button>
+</div>
+
+@if (!string.IsNullOrEmpty(_msg))
+{
+    <div class="alert alert-@_msgType alert-dismissible py-2 small">
+        @_msg <button type="button" class="btn-close btn-sm" @onclick='() => _msg = null'></button>
+    </div>
+}
+
+<!-- Create modal -->
+@if (_showCreate)
+{
+    <div class="card shadow mb-3 border-primary">
+        <div class="card-header bg-primary text-white d-flex justify-content-between">
+            <h6 class="mb-0">إنشاء مستخدم جديد</h6>
+            <button class="btn btn-sm btn-light" @onclick='() => _showCreate = false'>×</button>
+        </div>
+        <div class="card-body">
+            <div class="row g-3">
+                <div class="col-md-4">
+                    <label class="form-label small">اسم المستخدم *</label>
+                    <input class="form-control" @bind="_newUser.Username" placeholder="username" />
+                </div>
+                <div class="col-md-4">
+                    <label class="form-label small">البريد الإلكتروني *</label>
+                    <input class="form-control" type="email" @bind="_newUser.Email" />
+                </div>
+                <div class="col-md-4">
+                    <label class="form-label small">كلمة المرور *</label>
+                    <input class="form-control" type="password" @bind="_newUser.Password" placeholder="8+ أحرف" />
+                </div>
+                <div class="col-md-4">
+                    <label class="form-label small">الدور</label>
+                    <select class="form-select" @bind="_newUser.Role">
+                        <option value="user">مستخدم</option>
+                        <option value="admin">مدير</option>
+                    </select>
+                </div>
+                <div class="col-md-8">
+                    <label class="form-label small">الصلاحيات</label>
+                    <div class="d-flex gap-3">
+                        @foreach (var perm in new[] { "upload", "review", "approve" })
+                        {
+                            <div class="form-check">
+                                <input class="form-check-input" type="checkbox" id="p_@perm"
+                                       checked="@_newUser.Permissions.Contains(perm)"
+                                       @onchange="e => TogglePerm(perm, (bool)e.Value!)" />
+                                <label class="form-check-label" for="p_@perm">@perm</label>
+                            </div>
+                        }
+                    </div>
+                </div>
+            </div>
+            <div class="mt-3 d-flex gap-2">
+                <button class="btn btn-success btn-sm" @onclick="CreateUserAsync">
+                    <i class="bi bi-check-circle me-1"></i>إنشاء
+                </button>
+                <button class="btn btn-outline-secondary btn-sm" @onclick='() => _showCreate = false'>إلغاء</button>
+            </div>
+        </div>
+    </div>
+}
+
+<div class="card shadow-sm">
+    <div class="table-responsive">
+        <table class="table table-hover align-middle mb-0">
+            <thead class="table-light">
+                <tr>
+                    <th>#</th><th>المستخدم</th><th>البريد</th><th>الدور</th>
+                    <th>الصلاحيات</th><th>الحالة</th><th>آخر دخول</th><th>إجراءات</th>
+                </tr>
+            </thead>
+            <tbody>
+                @foreach (var u in _users)
+                {
+                    <tr>
+                        <td class="text-muted small">@u.Id</td>
+                        <td><i class="bi bi-person-circle me-1 text-primary"></i>@u.Username</td>
+                        <td class="small text-muted">@u.Email</td>
+                        <td><span class="badge @(u.Role == "admin" ? "bg-danger" : "bg-secondary")">@u.Role</span></td>
+                        <td>
+                            @foreach (var p in u.Permissions)
+                            {
+                                <span class="badge bg-info text-dark me-1 small">@p</span>
+                            }
+                        </td>
+                        <td>
+                            <span class="badge @(u.IsActive ? "bg-success" : "bg-secondary")">
+                                @(u.IsActive ? "نشط" : "معطل")
+                            </span>
+                            @if (u.LockedUntil.HasValue && u.LockedUntil > DateTime.UtcNow)
+                            {
+                                <span class="badge bg-danger ms-1">مقفل</span>
+                            }
+                        </td>
+                        <td class="small text-muted">@(u.LastLoginAt?.ToString("dd/MM/yyyy HH:mm") ?? "—")</td>
+                        <td>
+                            <div class="d-flex gap-1">
+                                <button class="btn btn-sm btn-outline-@(u.IsActive ? "warning" : "success")"
+                                        @onclick="() => ToggleActiveAsync(u)"
+                                        title="@(u.IsActive ? "تعطيل" : "تفعيل")">
+                                    <i class="bi bi-@(u.IsActive ? "pause" : "play")"></i>
+                                </button>
+                                @if (u.LockedUntil.HasValue && u.LockedUntil > DateTime.UtcNow)
+                                {
+                                    <button class="btn btn-sm btn-outline-primary" @onclick="() => UnlockAsync(u)" title="إلغاء القفل">
+                                        <i class="bi bi-unlock"></i>
+                                    </button>
+                                }
+                            </div>
+                        </td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    </div>
+</div>
+
+@code {
+    private bool _authenticated;
+    private List<User> _users = [];
+    private bool _showCreate;
+    private string? _msg;
+    private string _msgType = "success";
+
+    private CreateModel _newUser = new();
+
+    protected override async Task OnInitializedAsync()
+    {
+        var role = HttpCtx.HttpContext?.Session.GetString("role");
+        if (role != "admin") { Nav.NavigateTo("/", true); return; }
+        _authenticated = true;
+        await LoadAsync();
+    }
+
+    private async Task LoadAsync() =>
+        _users = await Db.Users.OrderBy(u => u.Username).ToListAsync();
+
+    private void TogglePerm(string perm, bool add)
+    {
+        if (add && !_newUser.Permissions.Contains(perm))
+            _newUser.Permissions = [.._newUser.Permissions, perm];
+        else if (!add)
+            _newUser.Permissions = _newUser.Permissions.Where(p => p != perm).ToArray();
+    }
+
+    private async Task CreateUserAsync()
+    {
+        if (string.IsNullOrWhiteSpace(_newUser.Username) || string.IsNullOrWhiteSpace(_newUser.Password))
+        { _msg = "اسم المستخدم وكلمة المرور مطلوبان."; _msgType = "danger"; return; }
+
+        if (!AuthService.IsPasswordStrong(_newUser.Password, out var err))
+        { _msg = err; _msgType = "danger"; return; }
+
+        try
+        {
+            var user = await AuthSvc.CreateUserAsync(_newUser.Username, _newUser.Email, _newUser.Password, _newUser.Role, _newUser.Permissions);
+            var adminId = int.TryParse(HttpCtx.HttpContext?.Session.GetString("userId"), out var id) ? id : (int?)null;
+            var adminName = HttpCtx.HttpContext?.Session.GetString("username");
+            await Audit.LogAsync(adminId, adminName, "USER_CREATED", "user", user.Id, $"أنشأ مستخدم: {user.Username}");
+            _msg = $"تم إنشاء المستخدم '{user.Username}' بنجاح.";
+            _msgType = "success";
+            _showCreate = false;
+            _newUser = new();
+            await LoadAsync();
+        }
+        catch (Exception ex)
+        {
+            _msg = $"فشل الإنشاء: {ex.Message}"; _msgType = "danger";
+        }
+    }
+
+    private async Task ToggleActiveAsync(User u)
+    {
+        u.IsActive = !u.IsActive;
+        await Db.SaveChangesAsync();
+        var adminId = int.TryParse(HttpCtx.HttpContext?.Session.GetString("userId"), out var id) ? id : (int?)null;
+        var adminName = HttpCtx.HttpContext?.Session.GetString("username");
+        await Audit.LogAsync(adminId, adminName, u.IsActive ? "USER_ACTIVATED" : "USER_DEACTIVATED", "user", u.Id);
+        _msg = $"تم {(u.IsActive ? "تفعيل" : "تعطيل")} المستخدم."; _msgType = "success";
+    }
+
+    private async Task UnlockAsync(User u)
+    {
+        u.LockedUntil = null;
+        u.FailedLoginAttempts = 0;
+        await Db.SaveChangesAsync();
+        _msg = "تم إلغاء قفل الحساب."; _msgType = "success";
+    }
+
+    class CreateModel
+    {
+        public string Username { get; set; } = "";
+        public string Email { get; set; } = "";
+        public string Password { get; set; } = "";
+        public string Role { get; set; } = "user";
+        public string[] Permissions { get; set; } = ["upload"];
+    }
+}
