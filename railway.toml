@@ -1,0 +1,23 @@
+# ============================================================
+# دارة الملك عبدالعزيز — Railway Configuration
+# ============================================================
+
+[build]
+# استخدام الـ Dockerfile الموحد لـ Railway
+dockerfilePath = "Dockerfile.railway"
+
+[deploy]
+# Railway يضبط PORT تلقائياً
+startCommand = "/start.sh"
+healthcheckPath = "/api/healthz"
+healthcheckTimeout = 60
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 3
+
+[[deploy.environmentVariables]]
+# قيم افتراضية — تُعدَّل من Railway Dashboard
+NODE_ENV = "production"
+GEMINI_OCR_MODEL = "gemini-2.5-flash"
+OCR_ENGINE = "gemini"
+API_INTERNAL_PORT = "3000"
+UPLOADS_DIR = "/data/uploads"
