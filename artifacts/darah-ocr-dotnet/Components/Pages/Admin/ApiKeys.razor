@@ -1,0 +1,172 @@
+@page "/admin/api-keys"
+@rendermode InteractiveServer
+@inject AppDbContext Db
+@inject NavigationManager Nav
+@inject IHttpContextAccessor HttpCtx
+@inject AuditService Audit
+
+<PageTitle>مفاتيح API</PageTitle>
+
+@if (!_authenticated) { return; }
+
+<div class="d-flex justify-content-between align-items-center mb-3">
+    <h5 class="mb-0"><i class="bi bi-key me-2"></i>مفاتيح API الخارجية</h5>
+    <button class="btn btn-primary btn-sm" @onclick="GenerateKey">
+        <i class="bi bi-plus-circle me-1"></i>إنشاء مفتاح جديد
+    </button>
+</div>
+
+@if (!string.IsNullOrEmpty(_newKeyPlaintext))
+{
+    <div class="alert alert-success">
+        <strong>مفتاح API الجديد (احفظه الآن — لن يُعرض مرة أخرى):</strong>
+        <div class="input-group mt-2">
+            <input type="text" class="form-control font-monospace" value="@_newKeyPlaintext" readonly />
+            <button class="btn btn-outline-success" @onclick='() => _newKeyPlaintext = null'>
+                <i class="bi bi-check"></i> تم الحفظ
+            </button>
+        </div>
+    </div>
+}
+
+@if (!string.IsNullOrEmpty(_msg))
+{
+    <div class="alert alert-@_msgType py-2 small">@_msg</div>
+}
+
+<!-- Create form -->
+@if (_showCreate)
+{
+    <div class="card mb-3 border-primary shadow-sm">
+        <div class="card-body">
+            <div class="row g-2 align-items-end">
+                <div class="col-md-4">
+                    <label class="form-label small">اسم المفتاح *</label>
+                    <input class="form-control" @bind="_newName" placeholder="مثال: تكامل نظام أرشيف" />
+                </div>
+                <div class="col-md-3">
+                    <label class="form-label small">المستخدم</label>
+                    <select class="form-select" @bind="_newUserId">
+                        @foreach (var u in _allUsers)
+                        {
+                            <option value="@u.Id">@u.Username</option>
+                        }
+                    </select>
+                </div>
+                <div class="col-md-3">
+                    <label class="form-label small">تاريخ الانتهاء (اختياري)</label>
+                    <input type="date" class="form-control" @bind="_newExpiry" />
+                </div>
+                <div class="col-md-2">
+                    <button class="btn btn-success w-100" @onclick="ConfirmCreate">إنشاء</button>
+                </div>
+            </div>
+        </div>
+    </div>
+}
+
+<div class="card shadow-sm">
+    <div class="table-responsive">
+        <table class="table table-hover align-middle mb-0">
+            <thead class="table-light">
+                <tr>
+                    <th>الاسم</th><th>البادئة</th><th>المستخدم</th>
+                    <th>الحالة</th><th>آخر استخدام</th><th>الانتهاء</th><th>الإنشاء</th><th>إجراء</th>
+                </tr>
+            </thead>
+            <tbody>
+                @if (!_keys.Any())
+                {
+                    <tr><td colspan="8" class="text-center py-3 text-muted">لا توجد مفاتيح</td></tr>
+                }
+                @foreach (var k in _keys)
+                {
+                    <tr>
+                        <td>@k.Name</td>
+                        <td><code>@k.Prefix...</code></td>
+                        <td class="small">@(k.User?.Username ?? "—")</td>
+                        <td><span class="badge @(k.IsActive ? "bg-success" : "bg-secondary")">@(k.IsActive ? "نشط" : "معطل")</span></td>
+                        <td class="small text-muted">@(k.LastUsedAt?.ToString("dd/MM/yyyy HH:mm") ?? "لم يُستخدم")</td>
+                        <td class="small text-muted">@(k.ExpiresAt?.ToString("dd/MM/yyyy") ?? "لا ينتهي")</td>
+                        <td class="small text-muted">@k.CreatedAt.ToString("dd/MM/yyyy")</td>
+                        <td>
+                            <button class="btn btn-sm btn-outline-@(k.IsActive ? "danger" : "success")"
+                                    @onclick="() => ToggleKeyAsync(k)">
+                                @(k.IsActive ? "إلغاء" : "تفعيل")
+                            </button>
+                        </td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    </div>
+</div>
+
+@code {
+    private bool _authenticated;
+    private List<ApiKey> _keys = [];
+    private List<User> _allUsers = [];
+    private bool _showCreate;
+    private string _newName = "";
+    private int _newUserId;
+    private DateTime? _newExpiry;
+    private string? _newKeyPlaintext;
+    private string? _msg;
+    private string _msgType = "success";
+
+    protected override async Task OnInitializedAsync()
+    {
+        var role = HttpCtx.HttpContext?.Session.GetString("role");
+        if (role != "admin") { Nav.NavigateTo("/", true); return; }
+        _authenticated = true;
+        _allUsers = await Db.Users.Where(u => u.IsActive).ToListAsync();
+        _newUserId = _allUsers.FirstOrDefault()?.Id ?? 0;
+        await LoadAsync();
+    }
+
+    private async Task LoadAsync() =>
+        _keys = await Db.ApiKeys.Include(k => k.User).OrderByDescending(k => k.CreatedAt).ToListAsync();
+
+    private void GenerateKey() { _showCreate = true; _newKeyPlaintext = null; }
+
+    private async Task ConfirmCreate()
+    {
+        if (string.IsNullOrWhiteSpace(_newName)) { _msg = "اسم المفتاح مطلوب."; _msgType = "danger"; return; }
+
+        var raw = $"dk_{Guid.NewGuid():N}{Guid.NewGuid():N}";
+        var prefix = raw[..12];
+        var hash = BCrypt.Net.BCrypt.HashPassword(raw, 8);
+
+        var key = new ApiKey
+        {
+            UserId = _newUserId,
+            Name = _newName.Trim(),
+            KeyHash = hash,
+            Prefix = prefix,
+            IsActive = true,
+            ExpiresAt = _newExpiry.HasValue ? _newExpiry.Value.ToUniversalTime() : null,
+            CreatedAt = DateTime.UtcNow
+        };
+
+        Db.ApiKeys.Add(key);
+        await Db.SaveChangesAsync();
+
+        var adminId = int.TryParse(HttpCtx.HttpContext?.Session.GetString("userId"), out var id) ? id : (int?)null;
+        var adminName = HttpCtx.HttpContext?.Session.GetString("username");
+        await Audit.LogAsync(adminId, adminName, "API_KEY_CREATED", "api_key", key.Id, $"المفتاح: {_newName}");
+
+        _newKeyPlaintext = raw;
+        _showCreate = false;
+        _newName = "";
+        _msg = "تم إنشاء مفتاح API بنجاح."; _msgType = "success";
+        await LoadAsync();
+    }
+
+    private async Task ToggleKeyAsync(ApiKey k)
+    {
+        k.IsActive = !k.IsActive;
+        await Db.SaveChangesAsync();
+        _msg = k.IsActive ? "تم تفعيل المفتاح." : "تم إلغاء المفتاح.";
+        _msgType = "success";
+    }
+}
