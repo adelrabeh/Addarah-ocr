@@ -1,0 +1,265 @@
+@page "/jobs"
+@rendermode InteractiveServer
+@inject AppDbContext Db
+@inject NavigationManager Nav
+@inject IHttpContextAccessor HttpCtx
+@inject IJSRuntime JS
+@inject JobQueueService Queue
+
+<PageTitle>الوثائق</PageTitle>
+
+@if (!_authenticated) { <p>جارٍ التحقق...</p> return; }
+
+<div class="d-flex justify-content-between align-items-center mb-3">
+    <h5 class="mb-0"><i class="bi bi-file-earmark-text me-2"></i>الوثائق (@_totalCount)</h5>
+    <div class="d-flex gap-2">
+        @if (_selectedIds.Any())
+        {
+            <button class="btn btn-outline-success btn-sm" @onclick="BulkExportAsync">
+                <i class="bi bi-file-zip me-1"></i>تصدير مجمع (@_selectedIds.Count)
+            </button>
+        }
+        <a href="/upload" class="btn btn-primary btn-sm">
+            <i class="bi bi-cloud-upload me-1"></i>رفع وثيقة
+        </a>
+    </div>
+</div>
+
+<!-- Filters -->
+<div class="card mb-3 shadow-sm">
+    <div class="card-body py-2">
+        <div class="row g-2 align-items-center">
+            <div class="col-md-4">
+                <input type="text" class="form-control form-control-sm" placeholder="بحث في أسماء الملفات..."
+                       @bind="_searchQuery" @oninput="OnSearchInput" />
+            </div>
+            <div class="col-md-3">
+                <select class="form-select form-select-sm" @bind="_statusFilter" @bind:after="RefreshAsync">
+                    <option value="">كل الحالات</option>
+                    <option value="pending">قيد الانتظار</option>
+                    <option value="processing">جارٍ المعالجة</option>
+                    <option value="ocr_complete">اكتمل OCR</option>
+                    <option value="reviewed">تمت المراجعة</option>
+                    <option value="approved">معتمدة</option>
+                    <option value="rejected">مرفوضة</option>
+                    <option value="failed">فشل</option>
+                </select>
+            </div>
+            <div class="col-md-2">
+                <button class="btn btn-sm btn-outline-secondary w-100" @onclick="ResetFilters">
+                    <i class="bi bi-x-circle me-1"></i>إعادة تعيين
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Table -->
+<div class="card shadow-sm">
+    <div class="table-responsive">
+        <table class="table table-hover align-middle mb-0">
+            <thead class="table-light">
+                <tr>
+                    <th><input type="checkbox" @onchange="ToggleSelectAll" /></th>
+                    <th>#</th>
+                    <th>الملف</th>
+                    <th>الحجم</th>
+                    <th>الحالة</th>
+                    <th>الثقة</th>
+                    <th>الرافع</th>
+                    <th>التاريخ</th>
+                    <th>إجراءات</th>
+                </tr>
+            </thead>
+            <tbody>
+                @if (_loading)
+                {
+                    <tr><td colspan="9" class="text-center py-4"><span class="spinner-border spinner-border-sm"></span> جارٍ التحميل...</td></tr>
+                }
+                else if (!_jobs.Any())
+                {
+                    <tr><td colspan="9" class="text-center py-4 text-muted">لا توجد وثائق</td></tr>
+                }
+                else
+                {
+                    @foreach (var job in _jobs)
+                    {
+                        <tr>
+                            <td>
+                                <input type="checkbox"
+                                       checked="@_selectedIds.Contains(job.Id)"
+                                       @onchange="e => ToggleSelect(job.Id, (bool)e.Value!)" />
+                            </td>
+                            <td class="text-muted small">@job.Id</td>
+                            <td>
+                                <i class="bi bi-file-earmark-@(job.FileType == "pdf" ? "pdf text-danger" : "image text-primary") me-1"></i>
+                                <span title="@job.OriginalFilename">
+                                    @(job.OriginalFilename.Length > 35 ? job.OriginalFilename[..35] + "…" : job.OriginalFilename)
+                                </span>
+                                @if (job.Status == "processing" && job.TotalPages > 0)
+                                {
+                                    <div class="progress mt-1" style="height:4px;">
+                                        <div class="progress-bar progress-bar-striped progress-bar-animated"
+                                             style="width:@((job.ProcessingPage ?? 0) * 100 / job.TotalPages)%"></div>
+                                    </div>
+                                    <small class="text-muted">@job.ProcessingPage / @job.TotalPages صفحة</small>
+                                }
+                            </td>
+                            <td class="small text-muted">@FormatSize(job.FileSize)</td>
+                            <td><span class="badge @StatusBadge(job.Status)">@StatusLabel(job.Status)</span></td>
+                            <td>
+                                @if (job.OcrResult != null)
+                                {
+                                    <span class="badge @ConfBadge(job.OcrResult.ConfidenceScore)">
+                                        @job.OcrResult.ConfidenceScore%
+                                    </span>
+                                }
+                            </td>
+                            <td class="small">@(job.User?.Username ?? "—")</td>
+                            <td class="small text-muted">@job.CreatedAt.ToString("dd/MM/yyyy")</td>
+                            <td>
+                                <div class="d-flex gap-1">
+                                    <a href="/jobs/@job.Id" class="btn btn-sm btn-outline-primary" title="عرض">
+                                        <i class="bi bi-eye"></i>
+                                    </a>
+                                    @if (job.Status == "failed")
+                                    {
+                                        <button class="btn btn-sm btn-outline-warning" title="إعادة المعالجة"
+                                                @onclick="() => RetryJobAsync(job.Id)">
+                                            <i class="bi bi-arrow-clockwise"></i>
+                                        </button>
+                                    }
+                                    @if (_role == "admin")
+                                    {
+                                        <button class="btn btn-sm btn-outline-danger" title="حذف"
+                                                @onclick="() => DeleteJobAsync(job.Id)">
+                                            <i class="bi bi-trash"></i>
+                                        </button>
+                                    }
+                                </div>
+                            </td>
+                        </tr>
+                    }
+                }
+            </tbody>
+        </table>
+    </div>
+
+    <!-- Pagination -->
+    @if (_totalPages > 1)
+    {
+        <div class="card-footer d-flex justify-content-center gap-2">
+            <button class="btn btn-sm btn-outline-secondary" disabled="@(_page == 1)" @onclick="() => GotoPage(_page - 1)">
+                <i class="bi bi-chevron-right"></i>
+            </button>
+            @for (int p = Math.Max(1, _page - 2); p <= Math.Min(_totalPages, _page + 2); p++)
+            {
+                var pg = p;
+                <button class="btn btn-sm @(pg == _page ? "btn-primary" : "btn-outline-secondary")"
+                        @onclick="() => GotoPage(pg)">@pg</button>
+            }
+            <button class="btn btn-sm btn-outline-secondary" disabled="@(_page == _totalPages)" @onclick="() => GotoPage(_page + 1)">
+                <i class="bi bi-chevron-left"></i>
+            </button>
+        </div>
+    }
+</div>
+
+@code {
+    private bool _authenticated;
+    private string _role = "";
+    private List<Job> _jobs = [];
+    private bool _loading = true;
+    private string _searchQuery = "";
+    private string _statusFilter = "";
+    private int _page = 1;
+    private int _totalCount;
+    private int _totalPages;
+    private const int PageSize = 20;
+    private HashSet<int> _selectedIds = [];
+
+    protected override async Task OnInitializedAsync()
+    {
+        var username = HttpCtx.HttpContext?.Session.GetString("username");
+        if (string.IsNullOrEmpty(username)) { Nav.NavigateTo("/login", true); return; }
+        _authenticated = true;
+        _role = HttpCtx.HttpContext?.Session.GetString("role") ?? "";
+        await RefreshAsync();
+    }
+
+    private async Task RefreshAsync()
+    {
+        _loading = true;
+        var query = Db.Jobs.Include(j => j.User).Include(j => j.OcrResult).AsQueryable();
+
+        if (!string.IsNullOrWhiteSpace(_searchQuery))
+            query = query.Where(j => j.OriginalFilename.Contains(_searchQuery));
+
+        if (!string.IsNullOrWhiteSpace(_statusFilter))
+            query = query.Where(j => j.Status == _statusFilter);
+
+        _totalCount = await query.CountAsync();
+        _totalPages = Math.Max(1, (int)Math.Ceiling(_totalCount / (double)PageSize));
+        _page = Math.Min(_page, _totalPages);
+
+        _jobs = await query.OrderByDescending(j => j.CreatedAt)
+            .Skip((_page - 1) * PageSize).Take(PageSize).ToListAsync();
+
+        _loading = false;
+    }
+
+    private void OnSearchInput(ChangeEventArgs e) { _searchQuery = e.Value?.ToString() ?? ""; _ = RefreshAsync(); }
+    private void ResetFilters() { _searchQuery = ""; _statusFilter = ""; _page = 1; _ = RefreshAsync(); }
+    private void GotoPage(int p) { _page = p; _ = RefreshAsync(); }
+    private void ToggleSelect(int id, bool v) { if (v) _selectedIds.Add(id); else _selectedIds.Remove(id); }
+    private void ToggleSelectAll(ChangeEventArgs e) { if ((bool)e.Value!) _selectedIds = [.._jobs.Select(j => j.Id)]; else _selectedIds.Clear(); }
+
+    private async Task RetryJobAsync(int id)
+    {
+        var job = await Db.Jobs.FindAsync(id);
+        if (job == null) return;
+        job.Status = "pending";
+        job.ErrorMessage = null;
+        job.RetryCount++;
+        await Db.SaveChangesAsync();
+        Queue.EnqueueJob(id);
+        await RefreshAsync();
+    }
+
+    private async Task DeleteJobAsync(int id)
+    {
+        var result = await Db.OcrResults.FirstOrDefaultAsync(r => r.JobId == id);
+        if (result != null) Db.OcrResults.Remove(result);
+        var job = await Db.Jobs.FindAsync(id);
+        if (job != null) Db.Jobs.Remove(job);
+        await Db.SaveChangesAsync();
+        await RefreshAsync();
+    }
+
+    private async Task BulkExportAsync()
+    {
+        var ids = string.Join(",", _selectedIds);
+        await JS.InvokeVoidAsync("open", $"/api/export/zip?ids={ids}", "_blank");
+    }
+
+    static string FormatSize(long bytes)
+    {
+        if (bytes < 1024) return $"{bytes} B";
+        if (bytes < 1024 * 1024) return $"{bytes / 1024} KB";
+        return $"{bytes / 1024 / 1024:F1} MB";
+    }
+
+    static string StatusBadge(string s) => s switch
+    {
+        "pending" => "bg-secondary", "processing" => "bg-warning text-dark",
+        "ocr_complete" => "bg-info text-dark", "reviewed" => "bg-primary",
+        "approved" => "bg-success", "rejected" or "failed" => "bg-danger",
+        _ => "bg-light text-dark"
+    };
+    static string StatusLabel(string s) => s switch
+    {
+        "pending" => "انتظار", "processing" => "معالجة", "ocr_complete" => "OCR مكتمل",
+        "reviewed" => "مراجع", "approved" => "معتمد", "rejected" => "مرفوض", "failed" => "فشل", _ => s
+    };
+    static string ConfBadge(double c) => c >= 85 ? "bg-success" : c >= 65 ? "bg-warning text-dark" : "bg-danger";
+}
