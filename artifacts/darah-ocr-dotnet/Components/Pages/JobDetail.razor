@@ -1,0 +1,324 @@
+@page "/jobs/{Id:int}"
+@rendermode InteractiveServer
+@inject AppDbContext Db
+@inject NavigationManager Nav
+@inject IHttpContextAccessor HttpCtx
+@inject AuditService Audit
+@inject DocxService DocxSvc
+@inject IJSRuntime JS
+@inject JobProgressService ProgressSvc
+@implements IAsyncDisposable
+
+<PageTitle>وثيقة #@Id</PageTitle>
+
+@if (!_authenticated) { <p>جارٍ التحقق...</p> return; }
+@if (_loading) { <div class="text-center py-5"><span class="spinner-border"></span></div> return; }
+@if (_job == null) { <div class="alert alert-danger">الوثيقة غير موجودة.</div> return; }
+
+<div class="d-flex justify-content-between align-items-start mb-3">
+    <div>
+        <h5 class="mb-1"><i class="bi bi-file-earmark-text me-2"></i>@_job.OriginalFilename</h5>
+        <div class="d-flex gap-2 align-items-center">
+            <span class="badge @StatusBadge(_job.Status) fs-6">@StatusLabel(_job.Status)</span>
+            <small class="text-muted">رُفعت @_job.CreatedAt.ToString("dd/MM/yyyy HH:mm")</small>
+        </div>
+    </div>
+    <div class="d-flex gap-2">
+        @if (_job.OcrResult != null)
+        {
+            <button class="btn btn-outline-success btn-sm" @onclick="DownloadDocxAsync">
+                <i class="bi bi-file-word me-1"></i>تنزيل DOCX
+            </button>
+        }
+        <a href="/jobs" class="btn btn-outline-secondary btn-sm">
+            <i class="bi bi-arrow-right me-1"></i>عودة
+        </a>
+    </div>
+</div>
+
+<!-- Progress bar for processing -->
+@if (_job.Status == "processing")
+{
+    <div class="alert alert-warning">
+        <div class="d-flex align-items-center gap-2 mb-2">
+            <span class="spinner-border spinner-border-sm"></span>
+            <strong>جارٍ معالجة OCR...</strong>
+        </div>
+        @if (_job.TotalPages > 0)
+        {
+            <div class="progress" style="height:8px;">
+                <div class="progress-bar progress-bar-striped progress-bar-animated"
+                     style="width:@((_job.ProcessingPage ?? 0) * 100 / _job.TotalPages)%"></div>
+            </div>
+            <small class="mt-1 d-block">الصفحة @_job.ProcessingPage من @_job.TotalPages</small>
+        }
+    </div>
+}
+
+<div class="row g-3">
+    <!-- Left: Preview -->
+    <div class="col-md-5">
+        <div class="card shadow-sm h-100">
+            <div class="card-header"><h6 class="mb-0"><i class="bi bi-eye me-2"></i>معاينة الوثيقة</h6></div>
+            <div class="card-body text-center p-2">
+                @if (_job.FileType is "jpg" or "jpeg" or "png" or "tif" or "tiff")
+                {
+                    <img src="/api/preview/@_job.Id" alt="معاينة" class="img-fluid rounded"
+                         style="max-height:600px; object-fit:contain;" />
+                }
+                else if (_job.FileType == "pdf")
+                {
+                    <iframe src="/api/preview/@_job.Id" style="width:100%;height:600px;border:0;" title="معاينة PDF"></iframe>
+                }
+                else
+                {
+                    <div class="text-muted py-5">لا توجد معاينة متاحة</div>
+                }
+            </div>
+        </div>
+    </div>
+
+    <!-- Right: OCR + Actions -->
+    <div class="col-md-7">
+        <!-- OCR Result -->
+        @if (_job.OcrResult != null)
+        {
+            <div class="card shadow-sm mb-3">
+                <div class="card-header d-flex justify-content-between align-items-center">
+                    <h6 class="mb-0"><i class="bi bi-text-paragraph me-2"></i>النص المستخرج</h6>
+                    <div class="d-flex gap-2 align-items-center">
+                        <span class="badge @ConfBadge(_job.OcrResult.ConfidenceScore)">
+                            @_job.OcrResult.ConfidenceScore% ثقة
+                        </span>
+                        <span class="badge bg-secondary">@_job.OcrResult.QualityLevel</span>
+                        <span class="text-muted small">@_job.OcrResult.WordCount كلمة</span>
+                    </div>
+                </div>
+                <div class="card-body">
+                    <ul class="nav nav-tabs mb-3" id="textTabs">
+                        <li class="nav-item">
+                            <button class="nav-link @(_activeTab == "refined" ? "active" : "")"
+                                    @onclick='() => _activeTab = "refined"'>النص المحسّن</button>
+                        </li>
+                        <li class="nav-item">
+                            <button class="nav-link @(_activeTab == "raw" ? "active" : "")"
+                                    @onclick='() => _activeTab = "raw"'>النص الخام</button>
+                        </li>
+                    </ul>
+                    @if (_activeTab == "refined")
+                    {
+                        <textarea class="form-control font-arabic"
+                                  style="height:300px; direction:rtl; font-family:Arial,sans-serif;"
+                                  value="@_job.OcrResult.RefinedText" readonly></textarea>
+                    }
+                    else
+                    {
+                        <textarea class="form-control font-arabic"
+                                  style="height:300px; direction:rtl; font-family:Arial,sans-serif;"
+                                  value="@_job.OcrResult.RawText" readonly></textarea>
+                    }
+                </div>
+            </div>
+        }
+
+        <!-- Actions panel -->
+        <div class="card shadow-sm">
+            <div class="card-header"><h6 class="mb-0"><i class="bi bi-gear me-2"></i>الإجراءات</h6></div>
+            <div class="card-body">
+                @if (!string.IsNullOrEmpty(_actionMsg))
+                {
+                    <div class="alert alert-@_actionMsgType py-2 small">@_actionMsg</div>
+                }
+
+                @if (_job.Status == "ocr_complete" && (_role == "admin" || _permissions.Contains("review")))
+                {
+                    <div class="mb-3">
+                        <label class="form-label small">ملاحظات المراجع</label>
+                        <textarea class="form-control" rows="2" @bind="_reviewNotes" placeholder="ملاحظات (اختياري)"></textarea>
+                    </div>
+                    <div class="d-flex gap-2">
+                        <button class="btn btn-primary" @onclick="ReviewAsync">
+                            <i class="bi bi-eye-fill me-1"></i>اعتماد المراجعة
+                        </button>
+                        <button class="btn btn-outline-danger" @onclick="RejectReviewAsync">
+                            <i class="bi bi-x-circle me-1"></i>رفض
+                        </button>
+                    </div>
+                }
+                else if (_job.Status == "reviewed" && (_role == "admin" || _permissions.Contains("approve")))
+                {
+                    <div class="mb-3">
+                        <label class="form-label small">ملاحظات المعتمد</label>
+                        <textarea class="form-control" rows="2" @bind="_approveNotes" placeholder="ملاحظات (اختياري)"></textarea>
+                    </div>
+                    <div class="d-flex gap-2">
+                        <button class="btn btn-success" @onclick="ApproveAsync">
+                            <i class="bi bi-check-circle me-1"></i>اعتماد نهائي
+                        </button>
+                        <button class="btn btn-outline-danger" @onclick="RejectApproveAsync">
+                            <i class="bi bi-x-circle me-1"></i>رفض
+                        </button>
+                    </div>
+                }
+                else if (_job.Status == "failed" && _role == "admin")
+                {
+                    <button class="btn btn-warning" @onclick="RetryAsync">
+                        <i class="bi bi-arrow-clockwise me-1"></i>إعادة المعالجة
+                    </button>
+                }
+                else
+                {
+                    <p class="text-muted small mb-0">
+                        @(_job.Status switch {
+                            "pending" => "الوثيقة في انتظار المعالجة.",
+                            "processing" => "جارٍ معالجة OCR...",
+                            "approved" => "تمت الموافقة على هذه الوثيقة.",
+                            "rejected" => "تم رفض هذه الوثيقة.",
+                            _ => "لا توجد إجراءات متاحة."
+                        })
+                    </p>
+                }
+            </div>
+        </div>
+    </div>
+</div>
+
+@code {
+    [Parameter] public int Id { get; set; }
+
+    private bool _authenticated;
+    private bool _loading = true;
+    private Job? _job;
+    private string _role = "";
+    private string[] _permissions = [];
+    private string _reviewNotes = "";
+    private string _approveNotes = "";
+    private string _activeTab = "refined";
+    private string? _actionMsg;
+    private string _actionMsgType = "success";
+    private bool _canEdit = false;
+    private IAsyncDisposable? _sub;
+    private int _userId;
+
+    protected override async Task OnInitializedAsync()
+    {
+        var username = HttpCtx.HttpContext?.Session.GetString("username");
+        if (string.IsNullOrEmpty(username)) { Nav.NavigateTo("/login", true); return; }
+        _authenticated = true;
+        _role = HttpCtx.HttpContext!.Session.GetString("role") ?? "";
+        _userId = int.TryParse(HttpCtx.HttpContext.Session.GetString("userId"), out var uid) ? uid : 0;
+        _permissions = (HttpCtx.HttpContext.Session.GetString("permissions") ?? "").Split(',');
+
+        await LoadJobAsync();
+
+        _sub = await ProgressSvc.SubscribeAsync(async evt =>
+        {
+            if (evt.JobId == Id)
+            {
+                await LoadJobAsync();
+                await InvokeAsync(StateHasChanged);
+            }
+        });
+    }
+
+    private async Task LoadJobAsync()
+    {
+        _job = await Db.Jobs.Include(j => j.User).Include(j => j.OcrResult)
+            .FirstOrDefaultAsync(j => j.Id == Id);
+        _loading = false;
+    }
+
+    private async Task ReviewAsync()
+    {
+        if (_job == null) return;
+        _job.Status = "reviewed";
+        _job.ReviewerId = _userId;
+        _job.ReviewNotes = _reviewNotes;
+        _job.ReviewedAt = DateTime.UtcNow;
+        _job.UpdatedAt = DateTime.UtcNow;
+        await Db.SaveChangesAsync();
+        await Audit.LogAsync(_userId, HttpCtx.HttpContext?.Session.GetString("username"),
+            "JOB_REVIEWED", "job", Id, _reviewNotes);
+        _actionMsg = "تمت المراجعة بنجاح.";
+        _actionMsgType = "success";
+    }
+
+    private async Task RejectReviewAsync()
+    {
+        if (_job == null) return;
+        _job.Status = "rejected";
+        _job.ReviewNotes = _reviewNotes;
+        _job.UpdatedAt = DateTime.UtcNow;
+        await Db.SaveChangesAsync();
+        await Audit.LogAsync(_userId, HttpCtx.HttpContext?.Session.GetString("username"),
+            "JOB_REJECTED_BY_REVIEWER", "job", Id, _reviewNotes);
+        _actionMsg = "تم رفض الوثيقة."; _actionMsgType = "warning";
+    }
+
+    private async Task ApproveAsync()
+    {
+        if (_job == null) return;
+        _job.Status = "approved";
+        _job.ApproverId = _userId;
+        _job.ApproveNotes = _approveNotes;
+        _job.ApprovedAt = DateTime.UtcNow;
+        _job.UpdatedAt = DateTime.UtcNow;
+        await Db.SaveChangesAsync();
+        await Audit.LogAsync(_userId, HttpCtx.HttpContext?.Session.GetString("username"),
+            "JOB_APPROVED", "job", Id, _approveNotes);
+        _actionMsg = "تم الاعتماد النهائي."; _actionMsgType = "success";
+    }
+
+    private async Task RejectApproveAsync()
+    {
+        if (_job == null) return;
+        _job.Status = "rejected";
+        _job.ApproveNotes = _approveNotes;
+        _job.UpdatedAt = DateTime.UtcNow;
+        await Db.SaveChangesAsync();
+        await Audit.LogAsync(_userId, HttpCtx.HttpContext?.Session.GetString("username"),
+            "JOB_REJECTED_BY_APPROVER", "job", Id, _approveNotes);
+        _actionMsg = "تم الرفض من المعتمد."; _actionMsgType = "warning";
+    }
+
+    private async Task RetryAsync()
+    {
+        if (_job == null) return;
+        _job.Status = "pending"; _job.ErrorMessage = null; _job.RetryCount++;
+        await Db.SaveChangesAsync();
+        var queue = HttpCtx.HttpContext!.RequestServices.GetRequiredService<JobQueueService>();
+        queue.EnqueueJob(Id);
+        _actionMsg = "تمت إعادة إرسال الوثيقة للمعالجة."; _actionMsgType = "info";
+    }
+
+    private async Task DownloadDocxAsync()
+    {
+        if (_job?.OcrResult == null) return;
+        var bytes = DocxSvc.GenerateDocx(
+            _job.OriginalFilename,
+            _job.OcrResult.RefinedText ?? "",
+            _job.OcrResult.ConfidenceScore,
+            _job.OcrResult.QualityLevel,
+            _job.OcrResult.CreatedAt);
+
+        var b64 = Convert.ToBase64String(bytes);
+        await JS.InvokeVoidAsync("downloadBase64", b64,
+            Path.GetFileNameWithoutExtension(_job.OriginalFilename) + ".docx",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
+    }
+
+    public async ValueTask DisposeAsync() { if (_sub != null) await _sub.DisposeAsync(); }
+
+    static string StatusBadge(string s) => s switch
+    {
+        "approved" => "bg-success", "reviewed" => "bg-primary",
+        "ocr_complete" => "bg-info text-dark", "processing" => "bg-warning text-dark",
+        "rejected" or "failed" => "bg-danger", _ => "bg-secondary"
+    };
+    static string StatusLabel(string s) => s switch
+    {
+        "pending" => "انتظار", "processing" => "معالجة", "ocr_complete" => "OCR مكتمل",
+        "reviewed" => "مراجع", "approved" => "معتمد", "rejected" => "مرفوض", "failed" => "فشل", _ => s
+    };
+    static string ConfBadge(double c) => c >= 85 ? "bg-success" : c >= 65 ? "bg-warning text-dark" : "bg-danger";
+}
