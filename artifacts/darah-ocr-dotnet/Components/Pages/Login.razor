@@ -1,0 +1,119 @@
+@page "/login"
+@page "/logout"
+@rendermode InteractiveServer
+@inject AuthService AuthSvc
+@inject AuditService AuditSvc
+@inject NavigationManager Nav
+@inject IHttpContextAccessor HttpCtx
+@layout DarahOcr.Components.Layout.MainLayout
+
+<PageTitle>تسجيل الدخول — دارة الملك عبدالعزيز</PageTitle>
+
+@if (_isLogout)
+{
+    <p>جارٍ تسجيل الخروج...</p>
+}
+else
+{
+    <div class="d-flex align-items-center justify-content-center min-vh-100" style="background: linear-gradient(135deg,#1a2236 0%,#2d3f5e 100%);">
+        <div class="card shadow-lg" style="width:400px; border-radius:16px; overflow:hidden;">
+            <div class="card-header text-center py-4" style="background:#1a2236;">
+                <div style="font-size:2rem; color:gold;">🏛️</div>
+                <h5 class="text-white mt-2 mb-0">دارة الملك عبدالعزيز</h5>
+                <small class="text-muted">منظومة رقمنة الوثائق</small>
+            </div>
+            <div class="card-body p-4">
+                @if (!string.IsNullOrEmpty(_error))
+                {
+                    <div class="alert alert-danger py-2 small">
+                        <i class="bi bi-exclamation-triangle me-1"></i>@_error
+                    </div>
+                }
+                <EditForm Model="_model" OnValidSubmit="HandleLoginAsync" FormName="login">
+                    <DataAnnotationsValidator />
+                    <div class="mb-3">
+                        <label class="form-label small fw-semibold">اسم المستخدم</label>
+                        <div class="input-group">
+                            <span class="input-group-text"><i class="bi bi-person"></i></span>
+                            <InputText @bind-Value="_model.Username" class="form-control" placeholder="أدخل اسم المستخدم" autocomplete="username" />
+                        </div>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label small fw-semibold">كلمة المرور</label>
+                        <div class="input-group">
+                            <span class="input-group-text"><i class="bi bi-lock"></i></span>
+                            <InputText @bind-Value="_model.Password" type="password" class="form-control" placeholder="أدخل كلمة المرور" autocomplete="current-password" />
+                        </div>
+                    </div>
+                    <button type="submit" class="btn btn-primary w-100 py-2" disabled="@_loading">
+                        @if (_loading)
+                        {
+                            <span class="spinner-border spinner-border-sm me-1"></span>
+                        }
+                        <i class="bi bi-box-arrow-in-right me-1"></i>تسجيل الدخول
+                    </button>
+                </EditForm>
+            </div>
+            <div class="card-footer text-center py-2 bg-light">
+                <small class="text-muted">النظام الداخلي — للموظفين المخولين فقط</small>
+            </div>
+        </div>
+    </div>
+}
+
+@code {
+    private LoginModel _model = new();
+    private string? _error;
+    private bool _loading;
+    private bool _isLogout;
+
+    protected override async Task OnInitializedAsync()
+    {
+        var path = new Uri(Nav.Uri).AbsolutePath;
+        if (path == "/logout")
+        {
+            _isLogout = true;
+            var session = HttpCtx.HttpContext?.Session;
+            var username = session?.GetString("username");
+            var userId = int.TryParse(session?.GetString("userId"), out var uid) ? (int?)uid : null;
+            session?.Clear();
+            await session!.CommitAsync();
+            if (username != null)
+                await AuditSvc.LogAsync(userId, username, "LOGOUT");
+            Nav.NavigateTo("/login", true);
+        }
+    }
+
+    private async Task HandleLoginAsync()
+    {
+        _loading = true;
+        _error = null;
+
+        var (user, error) = await AuthSvc.LoginAsync(_model.Username.Trim(), _model.Password);
+
+        if (user == null)
+        {
+            _error = error;
+            _loading = false;
+            return;
+        }
+
+        var session = HttpCtx.HttpContext!.Session;
+        session.SetString("userId", user.Id.ToString());
+        session.SetString("username", user.Username);
+        session.SetString("role", user.Role);
+        session.SetString("email", user.Email);
+        await session.CommitAsync();
+
+        await AuditSvc.LogAsync(user.Id, user.Username, "LOGIN",
+            ipAddress: HttpCtx.HttpContext?.Connection.RemoteIpAddress?.ToString());
+
+        Nav.NavigateTo("/", true);
+    }
+
+    private class LoginModel
+    {
+        public string Username { get; set; } = "";
+        public string Password { get; set; } = "";
+    }
+}
