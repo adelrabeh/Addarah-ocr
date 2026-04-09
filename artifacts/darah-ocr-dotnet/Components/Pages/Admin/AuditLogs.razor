@@ -1,0 +1,171 @@
+@page "/admin/audit"
+@rendermode InteractiveServer
+@inject AppDbContext Db
+@inject NavigationManager Nav
+@inject IHttpContextAccessor HttpCtx
+
+<PageTitle>سجل المراجعة</PageTitle>
+
+@if (!_authenticated) { return; }
+
+<div class="d-flex justify-content-between align-items-center mb-3">
+    <h5 class="mb-0"><i class="bi bi-journal-check me-2"></i>سجل المراجعة</h5>
+    <span class="badge bg-secondary">@_totalCount إجمالي</span>
+</div>
+
+<!-- Filters -->
+<div class="card mb-3 shadow-sm">
+    <div class="card-body py-2">
+        <div class="row g-2">
+            <div class="col-md-3">
+                <input type="text" class="form-control form-control-sm" placeholder="فلتر بالمستخدم..."
+                       value="@_userFilter"
+                       @oninput="OnUserFilterInput" />
+            </div>
+            <div class="col-md-3">
+                <select class="form-select form-select-sm" @bind="_actionFilter" @bind:after="RefreshAsync">
+                    <option value="">كل الإجراءات</option>
+                    <option value="LOGIN">تسجيل الدخول</option>
+                    <option value="LOGOUT">تسجيل الخروج</option>
+                    <option value="JOB_CREATED">رفع وثيقة</option>
+                    <option value="JOB_REVIEWED">مراجعة وثيقة</option>
+                    <option value="JOB_APPROVED">اعتماد وثيقة</option>
+                    <option value="JOB_REJECTED_BY_REVIEWER">رفض (مراجع)</option>
+                    <option value="JOB_REJECTED_BY_APPROVER">رفض (معتمد)</option>
+                    <option value="USER_CREATED">إنشاء مستخدم</option>
+                    <option value="ACCOUNT_LOCKED">قفل حساب</option>
+                </select>
+            </div>
+            <div class="col-md-2">
+                <button class="btn btn-sm btn-outline-secondary w-100" @onclick="ResetFilters">
+                    <i class="bi bi-x-circle me-1"></i>إعادة تعيين
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="card shadow-sm">
+    <div class="table-responsive">
+        <table class="table table-hover align-middle mb-0 small">
+            <thead class="table-light">
+                <tr>
+                    <th>#</th><th>الإجراء</th><th>المستخدم</th>
+                    <th>المورد</th><th>التفاصيل</th><th>الوقت</th>
+                </tr>
+            </thead>
+            <tbody>
+                @if (_loading)
+                {
+                    <tr><td colspan="6" class="text-center py-3"><span class="spinner-border spinner-border-sm"></span></td></tr>
+                }
+                @foreach (var log in _logs)
+                {
+                    <tr>
+                        <td class="text-muted">@log.Id</td>
+                        <td><span class="badge @ActionBadge(log.Action)">@ActionLabel(log.Action)</span></td>
+                        <td>@(log.Username ?? "—")</td>
+                        <td>
+                            @if (log.ResourceType == "job" && log.ResourceId.HasValue)
+                            {
+                                <a href="/jobs/@log.ResourceId">وثيقة #@log.ResourceId</a>
+                            }
+                            else
+                            {
+                                @(log.ResourceType ?? "—")
+                            }
+                        </td>
+                        <td class="text-muted" style="max-width:250px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"
+                            title="@log.Details">@(log.Details ?? "—")</td>
+                        <td class="text-muted">@log.CreatedAt.ToString("dd/MM/yyyy HH:mm:ss")</td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    </div>
+
+    @if (_totalPages > 1)
+    {
+        <div class="card-footer d-flex justify-content-center gap-2">
+            <button class="btn btn-sm btn-outline-secondary" disabled="@(_page == 1)" @onclick="() => GotoPage(_page - 1)">
+                <i class="bi bi-chevron-right"></i>
+            </button>
+            @for (int p = Math.Max(1, _page - 2); p <= Math.Min(_totalPages, _page + 2); p++)
+            {
+                var pg = p;
+                <button class="btn btn-sm @(pg == _page ? "btn-primary" : "btn-outline-secondary")"
+                        @onclick="() => GotoPage(pg)">@pg</button>
+            }
+            <button class="btn btn-sm btn-outline-secondary" disabled="@(_page == _totalPages)" @onclick="() => GotoPage(_page + 1)">
+                <i class="bi bi-chevron-left"></i>
+            </button>
+        </div>
+    }
+</div>
+
+@code {
+    private bool _authenticated;
+    private List<AuditLog> _logs = [];
+    private bool _loading = true;
+    private string _userFilter = "";
+    private string _actionFilter = "";
+    private int _page = 1;
+    private int _totalCount;
+    private int _totalPages;
+    private const int PageSize = 30;
+
+    protected override async Task OnInitializedAsync()
+    {
+        var role = HttpCtx.HttpContext?.Session.GetString("role");
+        if (role != "admin") { Nav.NavigateTo("/", true); return; }
+        _authenticated = true;
+        await RefreshAsync();
+    }
+
+    private async Task RefreshAsync()
+    {
+        _loading = true;
+        var q = Db.AuditLogs.AsQueryable();
+        if (!string.IsNullOrWhiteSpace(_userFilter))
+            q = q.Where(a => a.Username != null && EF.Functions.ILike(a.Username, $"%{_userFilter}%"));
+        if (!string.IsNullOrWhiteSpace(_actionFilter))
+            q = q.Where(a => a.Action == _actionFilter);
+
+        _totalCount = await q.CountAsync();
+        _totalPages = Math.Max(1, (int)Math.Ceiling(_totalCount / (double)PageSize));
+        _page = Math.Clamp(_page, 1, _totalPages);
+
+        _logs = await q.OrderByDescending(a => a.CreatedAt)
+            .Skip((_page - 1) * PageSize).Take(PageSize).ToListAsync();
+        _loading = false;
+    }
+
+    private void OnUserFilterInput(ChangeEventArgs e)
+    {
+        _userFilter = e.Value?.ToString() ?? "";
+        _page = 1;
+        _ = RefreshAsync();
+    }
+
+    private void ResetFilters() { _userFilter = ""; _actionFilter = ""; _page = 1; _ = RefreshAsync(); }
+    private void GotoPage(int p) { _page = p; _ = RefreshAsync(); }
+
+    static string ActionLabel(string a) => a switch
+    {
+        "LOGIN" => "دخول", "LOGOUT" => "خروج",
+        "JOB_CREATED" => "رفع وثيقة", "JOB_REVIEWED" => "مراجعة",
+        "JOB_APPROVED" => "اعتماد", "JOB_REJECTED_BY_REVIEWER" => "رفض (مراجع)",
+        "JOB_REJECTED_BY_APPROVER" => "رفض (معتمد)", "USER_CREATED" => "إنشاء مستخدم",
+        "USER_ACTIVATED" => "تفعيل", "USER_DEACTIVATED" => "تعطيل",
+        "ACCOUNT_LOCKED" => "قفل حساب", _ => a
+    };
+
+    static string ActionBadge(string a) => a switch
+    {
+        "LOGIN" => "bg-success", "LOGOUT" => "bg-secondary",
+        "JOB_CREATED" => "bg-primary", "JOB_REVIEWED" => "bg-info text-dark",
+        "JOB_APPROVED" => "bg-success", "JOB_REJECTED_BY_REVIEWER" or "JOB_REJECTED_BY_APPROVER" => "bg-danger",
+        "USER_CREATED" => "bg-primary", "USER_ACTIVATED" => "bg-success", "USER_DEACTIVATED" => "bg-warning text-dark",
+        "ACCOUNT_LOCKED" => "bg-danger", _ => "bg-secondary"
+    };
+}
