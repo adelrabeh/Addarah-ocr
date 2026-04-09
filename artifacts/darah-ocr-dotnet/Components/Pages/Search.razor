@@ -1,0 +1,169 @@
+@page "/search"
+@rendermode InteractiveServer
+@inject AppDbContext Db
+@inject NavigationManager Nav
+@inject IHttpContextAccessor HttpCtx
+
+<PageTitle>البحث النصي</PageTitle>
+
+@if (!_authenticated) { <p>جارٍ التحقق...</p> return; }
+
+<div class="mb-4">
+    <h5 class="mb-3"><i class="bi bi-search me-2"></i>البحث في النصوص المستخرجة</h5>
+    <div class="input-group input-group-lg">
+        <span class="input-group-text"><i class="bi bi-search"></i></span>
+        <input type="text" class="form-control" placeholder="ابحث في النصوص العربية المستخرجة..."
+               @bind="_query" @bind:event="oninput" @onkeydown="OnKeyDown"
+               style="direction:rtl; font-family:Arial,sans-serif;" />
+        <button class="btn btn-primary" @onclick="() => SearchAsync()" disabled="@_loading">
+            @if (_loading) { <span class="spinner-border spinner-border-sm me-1"></span> }
+            بحث
+        </button>
+    </div>
+</div>
+
+@if (_searched)
+{
+    <div class="d-flex justify-content-between align-items-center mb-3">
+        <span class="text-muted">
+            @if (_results.Any())
+            {
+                <text>تم العثور على <strong>@_totalCount</strong> نتيجة لـ "<strong>@_lastQuery</strong>"</text>
+            }
+            else
+            {
+                <text>لا توجد نتائج لـ "<strong>@_lastQuery</strong>"</text>
+            }
+        </span>
+    </div>
+
+    @if (_results.Any())
+    {
+        <div class="d-flex flex-column gap-3">
+            @foreach (var r in _results)
+            {
+                <div class="card shadow-sm">
+                    <div class="card-body">
+                        <div class="d-flex justify-content-between align-items-start mb-2">
+                            <div>
+                                <a href="/jobs/@r.JobId" class="fw-bold text-decoration-none">
+                                    <i class="bi bi-file-earmark-text me-1"></i>@r.OriginalFilename
+                                </a>
+                                <div class="text-muted small mt-1">
+                                    <span class="badge bg-secondary me-1">@r.FileType</span>
+                                    <span class="me-2">@r.WordCount كلمة</span>
+                                    <span class="badge @ConfBadge(r.Confidence)">@r.Confidence% ثقة</span>
+                                </div>
+                            </div>
+                            <div class="text-end small text-muted">
+                                <div>@r.CreatedAt.ToString("dd/MM/yyyy")</div>
+                                <span class="badge @StatusBadge(r.Status)">@StatusLabel(r.Status)</span>
+                            </div>
+                        </div>
+                        <div class="border-top pt-2 mt-2 text-muted small"
+                             style="direction:rtl; font-family:Arial,sans-serif; line-height:1.8;">
+                            @((MarkupString)r.Snippet)
+                        </div>
+                    </div>
+                    <div class="card-footer text-end">
+                        <a href="/jobs/@r.JobId" class="btn btn-sm btn-outline-primary">
+                            <i class="bi bi-arrow-left me-1"></i>عرض الوثيقة
+                        </a>
+                    </div>
+                </div>
+            }
+        </div>
+
+        @if (_totalPages > 1)
+        {
+            <div class="d-flex justify-content-center gap-2 mt-4">
+                <button class="btn btn-sm btn-outline-secondary" disabled="@(_page == 1)" @onclick="() => GotoPage(_page - 1)">
+                    <i class="bi bi-chevron-right"></i>
+                </button>
+                <span class="btn btn-sm btn-primary">@_page / @_totalPages</span>
+                <button class="btn btn-sm btn-outline-secondary" disabled="@(_page == _totalPages)" @onclick="() => GotoPage(_page + 1)">
+                    <i class="bi bi-chevron-left"></i>
+                </button>
+            </div>
+        }
+    }
+}
+
+@code {
+    private bool _authenticated;
+    private string _query = "";
+    private string _lastQuery = "";
+    private bool _loading;
+    private bool _searched;
+    private List<SearchResult> _results = [];
+    private int _totalCount;
+    private int _page = 1;
+    private int _totalPages;
+    private const int PageSize = 10;
+
+    protected override void OnInitialized()
+    {
+        var username = HttpCtx.HttpContext?.Session.GetString("username");
+        if (string.IsNullOrEmpty(username)) Nav.NavigateTo("/login", true);
+        else _authenticated = true;
+    }
+
+    private async Task OnKeyDown(KeyboardEventArgs e) { if (e.Key == "Enter") await SearchAsync(); }
+
+    private async Task GotoPage(int p) { _page = p; await SearchAsync(preservePage: true); }
+
+    private async Task SearchAsync(bool preservePage = false)
+    {
+        if (string.IsNullOrWhiteSpace(_query) || _query.Length < 2) return;
+        _loading = true; _searched = true; _lastQuery = _query.Trim();
+        if (!preservePage) _page = 1;
+
+        var q = _query.Trim().ToLower();
+
+        var baseQuery = Db.OcrResults
+            .Include(r => r.Job)
+            .Where(r => (r.RefinedText != null && EF.Functions.ILike(r.RefinedText, $"%{q}%"))
+                     || (r.RawText != null && EF.Functions.ILike(r.RawText, $"%{q}%")));
+
+        _totalCount = await baseQuery.CountAsync();
+        _totalPages = Math.Max(1, (int)Math.Ceiling(_totalCount / (double)PageSize));
+
+        var data = await baseQuery
+            .OrderByDescending(r => r.CreatedAt)
+            .Skip((_page - 1) * PageSize).Take(PageSize)
+            .ToListAsync();
+
+        _results = data.Select(r =>
+        {
+            var text = r.RefinedText ?? r.RawText ?? "";
+            var idx = text.ToLower().IndexOf(q, StringComparison.OrdinalIgnoreCase);
+            var start = Math.Max(0, idx - 100);
+            var end = Math.Min(text.Length, idx + q.Length + 100);
+            var snippet = text[start..end];
+            if (start > 0) snippet = "…" + snippet;
+            if (end < text.Length) snippet += "…";
+            snippet = snippet.Replace(q, $"<mark style='background:#fff3cd;'>{q}</mark>",
+                StringComparison.OrdinalIgnoreCase);
+
+            return new SearchResult(
+                r.JobId, r.Job?.OriginalFilename ?? "", r.Job?.FileType ?? "",
+                r.ConfidenceScore, r.WordCount, r.Job?.Status ?? "", r.CreatedAt, snippet);
+        }).ToList();
+
+        _loading = false;
+    }
+
+    record SearchResult(int JobId, string OriginalFilename, string FileType,
+        double Confidence, int WordCount, string Status, DateTime CreatedAt, string Snippet);
+
+    static string ConfBadge(double c) => c >= 85 ? "bg-success" : c >= 65 ? "bg-warning text-dark" : "bg-danger";
+    static string StatusBadge(string s) => s switch
+    {
+        "approved" => "bg-success", "reviewed" => "bg-primary",
+        "ocr_complete" => "bg-info text-dark", _ => "bg-secondary"
+    };
+    static string StatusLabel(string s) => s switch
+    {
+        "approved" => "معتمد", "reviewed" => "مراجع", "ocr_complete" => "OCR مكتمل", _ => s
+    };
+}
