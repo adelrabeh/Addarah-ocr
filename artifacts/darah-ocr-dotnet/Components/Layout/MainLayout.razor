@@ -1,0 +1,124 @@
+@inherits LayoutComponentBase
+@inject NavigationManager Nav
+@inject IHttpContextAccessor HttpCtx
+
+@{
+    var path = new Uri(Nav.Uri).AbsolutePath;
+    var isLoginPage = path == "/login";
+}
+
+@if (isLoginPage)
+{
+    @Body
+}
+else
+{
+    <div class="wrapper d-flex">
+        <!-- Sidebar -->
+        <nav class="sidebar d-flex flex-column" id="sidebar">
+            <div class="sidebar-header p-3 text-center border-bottom border-secondary">
+                <img src="darah-logo.png" alt="دارة" style="height:48px;" onerror="this.style.display='none'" />
+                <div class="sidebar-title mt-1">دارة الملك عبدالعزيز</div>
+                <div class="sidebar-subtitle">منظومة رقمنة الوثائق</div>
+            </div>
+
+            <ul class="nav flex-column p-2 flex-grow-1">
+                <li class="nav-item">
+                    <a href="/" class="nav-link @(path == "/" ? "active" : "")">
+                        <i class="bi bi-speedometer2"></i> لوحة التحكم
+                    </a>
+                </li>
+                <li class="nav-item">
+                    <a href="/jobs" class="nav-link @(path.StartsWith("/jobs") ? "active" : "")">
+                        <i class="bi bi-file-earmark-text"></i> الوثائق
+                    </a>
+                </li>
+                <li class="nav-item">
+                    <a href="/upload" class="nav-link @(path == "/upload" ? "active" : "")">
+                        <i class="bi bi-cloud-upload"></i> رفع وثيقة
+                    </a>
+                </li>
+                <li class="nav-item">
+                    <a href="/search" class="nav-link @(path == "/search" ? "active" : "")">
+                        <i class="bi bi-search"></i> البحث النصي
+                    </a>
+                </li>
+                <li class="nav-item mt-2">
+                    <div class="nav-section-label">الإدارة</div>
+                </li>
+                <li class="nav-item">
+                    <a href="/admin/users" class="nav-link @(path == "/admin/users" ? "active" : "")">
+                        <i class="bi bi-people"></i> المستخدمون
+                    </a>
+                </li>
+                <li class="nav-item">
+                    <a href="/admin/audit" class="nav-link @(path == "/admin/audit" ? "active" : "")">
+                        <i class="bi bi-journal-check"></i> سجل المراجعة
+                    </a>
+                </li>
+                <li class="nav-item">
+                    <a href="/admin/api-keys" class="nav-link @(path == "/admin/api-keys" ? "active" : "")">
+                        <i class="bi bi-key"></i> مفاتيح API
+                    </a>
+                </li>
+                <li class="nav-item">
+                    <a href="/admin/system" class="nav-link @(path == "/admin/system" ? "active" : "")">
+                        <i class="bi bi-graph-up"></i> الأداء
+                    </a>
+                </li>
+            </ul>
+
+            <div class="sidebar-footer p-3 border-top border-secondary">
+                <small class="text-muted d-block">الإصدار 2.0 — .NET 8</small>
+            </div>
+        </nav>
+
+        <!-- Main -->
+        <div class="main-content flex-grow-1 d-flex flex-column">
+            <!-- Top bar -->
+            <header class="topbar d-flex align-items-center justify-content-between px-4 py-2">
+                <div class="d-flex align-items-center gap-3">
+                    <button class="btn btn-sm btn-outline-secondary" onclick="document.getElementById('sidebar').classList.toggle('collapsed')">
+                        <i class="bi bi-list fs-5"></i>
+                    </button>
+                    <h6 class="mb-0 text-muted">@GetPageTitle(path)</h6>
+                </div>
+                <div class="d-flex align-items-center gap-3">
+                    <NotificationBell />
+                    <div class="dropdown">
+                        <button class="btn btn-sm btn-outline-primary dropdown-toggle" type="button" data-bs-toggle="dropdown">
+                            <i class="bi bi-person-circle me-1"></i>
+                            @(HttpCtx.HttpContext?.Session.GetString("username") ?? "مستخدم")
+                        </button>
+                        <ul class="dropdown-menu dropdown-menu-start">
+                            <li><span class="dropdown-item-text text-muted small">@(HttpCtx.HttpContext?.Session.GetString("role") ?? "")</span></li>
+                            <li><hr class="dropdown-divider" /></li>
+                            <li><a class="dropdown-item text-danger" href="/logout"><i class="bi bi-box-arrow-right me-1"></i>تسجيل الخروج</a></li>
+                        </ul>
+                    </div>
+                </div>
+            </header>
+
+            <!-- Page content -->
+            <main class="p-4 flex-grow-1">
+                @Body
+            </main>
+        </div>
+    </div>
+}
+
+@code {
+    static string GetPageTitle(string path) => path switch
+    {
+        "/" => "لوحة التحكم",
+        "/jobs" => "الوثائق",
+        "/upload" => "رفع وثيقة",
+        "/search" => "البحث النصي",
+        "/admin/users" => "إدارة المستخدمين",
+        "/admin/audit" => "سجل المراجعة",
+        "/admin/api-keys" => "مفاتيح API",
+        "/admin/system" => "إحصائيات الأداء",
+        _ when path.StartsWith("/jobs/") => "تفاصيل الوثيقة",
+        _ => "دارة الملك عبدالعزيز"
+    };
+}
