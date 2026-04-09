@@ -1,0 +1,154 @@
+@page "/"
+@rendermode InteractiveServer
+@inject AppDbContext Db
+@inject NavigationManager Nav
+@inject IHttpContextAccessor HttpCtx
+
+<PageTitle>لوحة التحكم</PageTitle>
+
+@if (!_authenticated)
+{
+    <p>جارٍ التحقق...</p>
+}
+else
+{
+    <div class="row g-4 mb-4">
+        <div class="col-md-3">
+            <div class="stat-card" style="border-right:4px solid #0d6efd;">
+                <div class="stat-icon bg-primary-subtle text-primary"><i class="bi bi-file-earmark-text fs-3"></i></div>
+                <div>
+                    <div class="stat-value">@_stats.Total</div>
+                    <div class="stat-label">إجمالي الوثائق</div>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-3">
+            <div class="stat-card" style="border-right:4px solid #fd7e14;">
+                <div class="stat-icon bg-warning-subtle text-warning"><i class="bi bi-hourglass-split fs-3"></i></div>
+                <div>
+                    <div class="stat-value">@_stats.Processing</div>
+                    <div class="stat-label">قيد المعالجة</div>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-3">
+            <div class="stat-card" style="border-right:4px solid #198754;">
+                <div class="stat-icon bg-success-subtle text-success"><i class="bi bi-check-circle fs-3"></i></div>
+                <div>
+                    <div class="stat-value">@_stats.Approved</div>
+                    <div class="stat-label">معتمدة</div>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-3">
+            <div class="stat-card" style="border-right:4px solid #dc3545;">
+                <div class="stat-icon bg-danger-subtle text-danger"><i class="bi bi-eye fs-3"></i></div>
+                <div>
+                    <div class="stat-value">@_stats.PendingReview</div>
+                    <div class="stat-label">تنتظر المراجعة</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Recent jobs -->
+    <div class="card shadow-sm">
+        <div class="card-header d-flex justify-content-between align-items-center">
+            <h6 class="mb-0"><i class="bi bi-clock-history me-2"></i>آخر الوثائق</h6>
+            <a href="/jobs" class="btn btn-sm btn-outline-primary">عرض الكل</a>
+        </div>
+        <div class="table-responsive">
+            <table class="table table-hover align-middle mb-0">
+                <thead class="table-light">
+                    <tr>
+                        <th>#</th>
+                        <th>اسم الملف</th>
+                        <th>الحالة</th>
+                        <th>المعالج</th>
+                        <th>التاريخ</th>
+                        <th></th>
+                    </tr>
+                </thead>
+                <tbody>
+                    @foreach (var job in _recentJobs)
+                    {
+                        <tr>
+                            <td class="text-muted small">@job.Id</td>
+                            <td>
+                                <i class="bi bi-file-earmark-@(job.FileType == "pdf" ? "pdf text-danger" : "image text-primary") me-1"></i>
+                                @(job.OriginalFilename.Length > 40 ? job.OriginalFilename[..40] + "…" : job.OriginalFilename)
+                            </td>
+                            <td><span class="badge @StatusBadge(job.Status)">@StatusLabel(job.Status)</span></td>
+                            <td class="small">@(job.User?.Username ?? "—")</td>
+                            <td class="small text-muted">@job.CreatedAt.ToString("dd/MM/yyyy HH:mm")</td>
+                            <td><a href="/jobs/@job.Id" class="btn btn-sm btn-outline-secondary">عرض</a></td>
+                        </tr>
+                    }
+                </tbody>
+            </table>
+        </div>
+    </div>
+}
+
+@code {
+    private bool _authenticated;
+    private DashboardStats _stats = new();
+    private List<Job> _recentJobs = [];
+
+    protected override async Task OnInitializedAsync()
+    {
+        var username = HttpCtx.HttpContext?.Session.GetString("username");
+        if (string.IsNullOrEmpty(username))
+        {
+            Nav.NavigateTo("/login", true);
+            return;
+        }
+        _authenticated = true;
+        await LoadDataAsync();
+    }
+
+    private async Task LoadDataAsync()
+    {
+        _stats.Total = await Db.Jobs.CountAsync();
+        _stats.Processing = await Db.Jobs.CountAsync(j => j.Status == "processing");
+        _stats.Approved = await Db.Jobs.CountAsync(j => j.Status == "approved");
+        _stats.PendingReview = await Db.Jobs.CountAsync(j => j.Status == "ocr_complete");
+
+        _recentJobs = await Db.Jobs.Include(j => j.User)
+            .OrderByDescending(j => j.CreatedAt)
+            .Take(10)
+            .ToListAsync();
+    }
+
+    static string StatusBadge(string status) => status switch
+    {
+        "pending" => "bg-secondary",
+        "processing" => "bg-warning text-dark",
+        "ocr_complete" => "bg-info text-dark",
+        "reviewed" => "bg-primary",
+        "approved" => "bg-success",
+        "rejected" => "bg-danger",
+        "failed" => "bg-danger",
+        _ => "bg-light text-dark"
+    };
+
+    static string StatusLabel(string status) => status switch
+    {
+        "pending" => "قيد الانتظار",
+        "processing" => "جارٍ المعالجة",
+        "ocr_complete" => "اكتمل OCR",
+        "reviewed" => "تمت المراجعة",
+        "approved" => "معتمدة",
+        "rejected" => "مرفوضة",
+        "failed" => "فشل",
+        _ => status
+    };
+
+    class DashboardStats
+    {
+        public int Total { get; set; }
+        public int Processing { get; set; }
+        public int Approved { get; set; }
+        public int PendingReview { get; set; }
+    }
+}
