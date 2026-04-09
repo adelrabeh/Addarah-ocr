@@ -1,0 +1,542 @@
+import { Router } from "express";
+import { db } from "@workspace/db";
+import { jobsTable, ocrResultsTable, projectMembersTable } from "@workspace/db";
+import { eq, desc, and, sql, inArray, isNull, or } from "drizzle-orm";
+import { join, dirname } from "path";
+import { fileURLToPath } from "url";
+import { createReadStream } from "fs";
+import { requireAuth, requirePermission } from "../lib/auth";
+import { enqueueJob } from "../lib/job-queue";
+import { logAction } from "../lib/audit";
+import { notifyJobReviewed, notifyJobFinalised } from "../lib/sse";
+import archiver from "archiver";
+import { generateDocx } from "../lib/docx-generator";
+import { ensureLocal } from "../lib/file-store";
+
+/** Get IDs of all projects the user is a member of */
+async function getUserProjectIds(userId: number): Promise<number[]> {
+  const rows = await db
+    .select({ projectId: projectMembersTable.projectId })
+    .from(projectMembersTable)
+    .where(eq(projectMembersTable.userId, userId));
+  return rows.map((r) => r.projectId);
+}
+
+/** Build a WHERE condition that isolates jobs to the current user's projects.
+ *  Admins have no restriction. Non-admins see only jobs in their projects. */
+async function buildJobAccessCondition(userId: number, isAdmin: boolean) {
+  if (isAdmin) return undefined;
+  const projectIds = await getUserProjectIds(userId);
+  if (projectIds.length === 0) {
+    // User has no projects — can only see jobs they uploaded with no project
+    return and(eq(jobsTable.userId, userId), isNull(jobsTable.projectId));
+  }
+  return or(
+    inArray(jobsTable.projectId, projectIds),
+    and(eq(jobsTable.userId, userId), isNull(jobsTable.projectId)),
+  );
+}
+
+import {
+  CreateJobBody,
+  GetJobParams,
+  ListJobsQueryParams,
+  DeleteJobParams,
+  RetryJobParams,
+  ProcessJobParams,
+} from "@workspace/api-zod";
+
+const router: Router = Router();
+const __packageRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
+const UPLOADS_DIR_CONST = process.env.UPLOADS_DIR ?? join(__packageRoot, "uploads");
+
+router.get("/jobs", requireAuth, async (req, res): Promise<void> => {
+  const parsed = ListJobsQueryParams.safeParse(req.query);
+  if (!parsed.success) {
+    res.status(400).json({ error: parsed.error.message });
+    return;
+  }
+
+  const { status, page = 1, limit = 20 } = parsed.data;
+  const offset = (page - 1) * limit;
+  const user = req.session.user!;
+
+  const accessCond = await buildJobAccessCondition(user.id, user.role === "admin");
+  const conditions: ReturnType<typeof eq>[] = [];
+  if (accessCond) conditions.push(accessCond as any);
+  if (status) conditions.push(eq(jobsTable.status, status) as any);
+
+  const whereClause = conditions.length > 0 ? and(...conditions) : undefined;
+
+  const [jobs, countResult] = await Promise.all([
+    db
+      .select()
+      .from(jobsTable)
+      .where(whereClause)
+      .orderBy(desc(jobsTable.createdAt))
+      .limit(limit)
+      .offset(offset),
+    db
+      .select({ count: sql<number>`count(*)::int` })
+      .from(jobsTable)
+      .where(whereClause),
+  ]);
+
+  const total = countResult[0]?.count ?? 0;
+
+  res.json({ jobs, total, page, limit });
+});
+
+router.post("/jobs", requireAuth, async (req, res): Promise<void> => {
+  const parsed = CreateJobBody.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: parsed.error.message });
+    return;
+  }
+
+  const user = req.session.user!;
+  const projectId: number | null = (req.body.projectId && !isNaN(parseInt(req.body.projectId)))
+    ? parseInt(req.body.projectId)
+    : null;
+
+  // Non-admins must be a member of the project
+  if (projectId && user.role !== "admin") {
+    const [membership] = await db
+      .select()
+      .from(projectMembersTable)
+      .where(and(eq(projectMembersTable.projectId, projectId), eq(projectMembersTable.userId, user.id)))
+      .limit(1);
+    if (!membership) {
+      res.status(403).json({ error: "ليس لديك صلاحية الرفع في هذا المشروع." });
+      return;
+    }
+  }
+
+  const [job] = await db
+    .insert(jobsTable)
+    .values({
+      userId: user.id,
+      projectId,
+      filename: parsed.data.filename,
+      originalFilename: parsed.data.originalFilename,
+      fileType: parsed.data.fileType,
+      fileSize: parsed.data.fileSize,
+      status: "pending",
+    })
+    .returning();
+
+  await logAction(req, "JOB_CREATED", "job", job.id, `Job created: ${parsed.data.originalFilename}${projectId ? ` [project ${projectId}]` : ""}`);
+
+  enqueueJob(job.id);
+
+  res.status(201).json(job);
+});
+
+router.get("/jobs/:id", requireAuth, async (req, res): Promise<void> => {
+  const params = GetJobParams.safeParse(req.params);
+  if (!params.success) {
+    res.status(400).json({ error: params.error.message });
+    return;
+  }
+
+  const user = req.session.user!;
+  const [job] = await db
+    .select()
+    .from(jobsTable)
+    .where(eq(jobsTable.id, params.data.id))
+    .limit(1);
+
+  if (!job) {
+    res.status(404).json({ error: "المهمة غير موجودة." });
+    return;
+  }
+
+  // Project isolation check
+  if (user.role !== "admin" && job.projectId) {
+    const projectIds = await getUserProjectIds(user.id);
+    if (!projectIds.includes(job.projectId)) {
+      res.status(403).json({ error: "ليس لديك صلاحية الوصول إلى هذه المهمة." });
+      return;
+    }
+  }
+
+  res.json(job);
+});
+
+router.delete("/jobs/:id", requireAuth, async (req, res): Promise<void> => {
+  const params = DeleteJobParams.safeParse(req.params);
+  if (!params.success) {
+    res.status(400).json({ error: params.error.message });
+    return;
+  }
+
+  // Verify job exists first
+  const [existing] = await db
+    .select()
+    .from(jobsTable)
+    .where(eq(jobsTable.id, params.data.id))
+    .limit(1);
+
+  if (!existing) {
+    res.status(404).json({ error: "المهمة غير موجودة." });
+    return;
+  }
+
+  // Delete related OCR results first (foreign key constraint)
+  await db.delete(ocrResultsTable).where(eq(ocrResultsTable.jobId, params.data.id));
+
+  // Now delete the job
+  await db.delete(jobsTable).where(eq(jobsTable.id, params.data.id));
+
+  await logAction(req, "JOB_DELETED", "job", params.data.id, `Job deleted: ${existing.originalFilename}`);
+
+  res.sendStatus(204);
+});
+
+// ── Retry All Failed Jobs ─────────────────────────────────────────────────────
+
+router.post("/jobs/retry-failed", requireAuth, async (req, res): Promise<void> => {
+  const failedJobs = await db
+    .select({ id: jobsTable.id, retryCount: jobsTable.retryCount })
+    .from(jobsTable)
+    .where(eq(jobsTable.status, "failed"));
+
+  if (failedJobs.length === 0) {
+    res.json({ retried: 0, message: "لا توجد مهام فاشلة لإعادة المحاولة." });
+    return;
+  }
+
+  const ids = failedJobs.map((j) => j.id);
+
+  await db
+    .update(jobsTable)
+    .set({ status: "pending", errorMessage: null })
+    .where(inArray(jobsTable.id, ids));
+
+  for (const job of failedJobs) {
+    enqueueJob(job.id);
+  }
+
+  await logAction(req, "JOBS_BULK_RETRIED", "job", undefined, `Retried ${ids.length} failed jobs: [${ids.join(", ")}]`);
+
+  res.json({ retried: ids.length, message: `تمت إعادة محاولة ${ids.length} مهمة فاشلة.` });
+});
+
+// ── Retry Single Job ──────────────────────────────────────────────────────────
+
+router.post("/jobs/:id/retry", requireAuth, async (req, res): Promise<void> => {
+  const params = RetryJobParams.safeParse(req.params);
+  if (!params.success) {
+    res.status(400).json({ error: params.error.message });
+    return;
+  }
+
+  const [job] = await db
+    .select()
+    .from(jobsTable)
+    .where(eq(jobsTable.id, params.data.id))
+    .limit(1);
+
+  if (!job) {
+    res.status(404).json({ error: "المهمة غير موجودة." });
+    return;
+  }
+
+  const [updated] = await db
+    .update(jobsTable)
+    .set({ status: "pending", errorMessage: null, retryCount: job.retryCount + 1 })
+    .where(eq(jobsTable.id, params.data.id))
+    .returning();
+
+  enqueueJob(params.data.id);
+
+  await logAction(req, "JOB_RETRIED", "job", params.data.id, `Job queued for retry #${job.retryCount + 1}`);
+
+  res.json(updated);
+});
+
+router.post("/jobs/:id/process", requireAuth, async (req, res): Promise<void> => {
+  const params = ProcessJobParams.safeParse(req.params);
+  if (!params.success) {
+    res.status(400).json({ error: params.error.message });
+    return;
+  }
+
+  const [job] = await db
+    .select()
+    .from(jobsTable)
+    .where(eq(jobsTable.id, params.data.id))
+    .limit(1);
+
+  if (!job) {
+    res.status(404).json({ error: "المهمة غير موجودة." });
+    return;
+  }
+
+  if (job.status === "processing") {
+    res.status(409).json({ error: "المهمة قيد المعالجة حالياً." });
+    return;
+  }
+
+  // Reset to pending and enqueue
+  const [updated] = await db
+    .update(jobsTable)
+    .set({ status: "pending", completedAt: null, startedAt: null, errorMessage: null })
+    .where(eq(jobsTable.id, params.data.id))
+    .returning();
+
+  enqueueJob(params.data.id);
+
+  await logAction(req, "JOB_PROCESSED", "job", params.data.id, `Job queued for processing: ${job.originalFilename}`);
+
+  res.json(updated);
+});
+
+// ── Quality Review Routes ─────────────────────────────────────────────────────
+
+router.post(
+  "/jobs/:id/review",
+  requireAuth,
+  requirePermission("review"),
+  async (req, res): Promise<void> => {
+    const jobId = parseInt(req.params.id, 10);
+    if (isNaN(jobId) || jobId <= 0) {
+      res.status(400).json({ error: "معرّف المهمة غير صالح." });
+      return;
+    }
+
+    const { action, notes } = req.body as { action?: string; notes?: string };
+    if (action !== "approve" && action !== "reject") {
+      res.status(400).json({ error: "الإجراء يجب أن يكون 'approve' أو 'reject'." });
+      return;
+    }
+    if (notes && notes.length > 1000) {
+      res.status(400).json({ error: "الملاحظات يجب أن تكون أقل من 1000 حرف." });
+      return;
+    }
+
+    const [job] = await db
+      .select()
+      .from(jobsTable)
+      .where(eq(jobsTable.id, jobId))
+      .limit(1);
+
+    if (!job) {
+      res.status(404).json({ error: "المهمة غير موجودة." });
+      return;
+    }
+
+    if (job.status !== "ocr_complete") {
+      res.status(409).json({
+        error: `لا يمكن مراجعة مهمة بحالة "${job.status}". يجب أن تكون المهمة في مرحلة "بانتظار المراجعة".`,
+      });
+      return;
+    }
+
+    const newStatus = action === "approve" ? "reviewed" : "rejected";
+    const reviewerId = req.session.user!.id;
+
+    const [updated] = await db
+      .update(jobsTable)
+      .set({
+        status: newStatus,
+        reviewerId,
+        reviewedAt: new Date(),
+        reviewNotes: notes ?? null,
+      })
+      .where(eq(jobsTable.id, jobId))
+      .returning();
+
+    const actionLabel = newStatus === "reviewed" ? "JOB_REVIEWED" : "JOB_REJECTED_BY_REVIEWER";
+    await logAction(
+      req,
+      actionLabel,
+      "job",
+      jobId,
+      `Job ${newStatus}: ${job.originalFilename}${notes ? ` — ${notes}` : ""}`,
+    );
+
+    // Notify approvers via SSE when job is reviewed (ready for final approval)
+    if (newStatus === "reviewed") {
+      notifyJobReviewed(jobId, job.originalFilename);
+    }
+
+    res.json(updated);
+  },
+);
+
+// ── Final Approval Route ──────────────────────────────────────────────────────
+
+router.post(
+  "/jobs/:id/approve",
+  requireAuth,
+  requirePermission("approve"),
+  async (req, res): Promise<void> => {
+    const jobId = parseInt(req.params.id, 10);
+    if (isNaN(jobId) || jobId <= 0) {
+      res.status(400).json({ error: "معرّف المهمة غير صالح." });
+      return;
+    }
+
+    const { action, notes } = req.body as { action?: string; notes?: string };
+    if (action !== "approve" && action !== "reject") {
+      res.status(400).json({ error: "الإجراء يجب أن يكون 'approve' أو 'reject'." });
+      return;
+    }
+    if (notes && notes.length > 1000) {
+      res.status(400).json({ error: "الملاحظات يجب أن تكون أقل من 1000 حرف." });
+      return;
+    }
+
+    const [job] = await db
+      .select()
+      .from(jobsTable)
+      .where(eq(jobsTable.id, jobId))
+      .limit(1);
+
+    if (!job) {
+      res.status(404).json({ error: "المهمة غير موجودة." });
+      return;
+    }
+
+    if (job.status !== "reviewed") {
+      res.status(409).json({
+        error: `لا يمكن اعتماد مهمة بحالة "${job.status}". يجب أن تكون المهمة في مرحلة "تمت المراجعة".`,
+      });
+      return;
+    }
+
+    const newStatus = action === "approve" ? "approved" : "rejected";
+    const approverId = req.session.user!.id;
+
+    const [updated] = await db
+      .update(jobsTable)
+      .set({
+        status: newStatus,
+        approverId,
+        approvedAt: new Date(),
+        approveNotes: notes ?? null,
+      })
+      .where(eq(jobsTable.id, jobId))
+      .returning();
+
+    const actionLabel = newStatus === "approved" ? "JOB_APPROVED" : "JOB_REJECTED_BY_APPROVER";
+    await logAction(
+      req,
+      actionLabel,
+      "job",
+      jobId,
+      `Job ${newStatus} (final): ${job.originalFilename}${notes ? ` — ${notes}` : ""}`,
+    );
+
+    // Notify all users via SSE
+    notifyJobFinalised(jobId, job.originalFilename, newStatus === "approved");
+
+    res.json(updated);
+  },
+);
+
+// ── Preview (serve original uploaded file) ────────────────────────────────────
+
+router.get("/jobs/:id/preview", requireAuth, async (req, res): Promise<void> => {
+  const jobId = parseInt(req.params["id"] ?? "", 10);
+  if (isNaN(jobId)) {
+    res.status(400).json({ error: "معرّف غير صالح." });
+    return;
+  }
+
+  const [job] = await db.select().from(jobsTable).where(eq(jobsTable.id, jobId)).limit(1);
+  if (!job) {
+    res.status(404).json({ error: "المهمة غير موجودة." });
+    return;
+  }
+
+  const filePath = join(UPLOADS_DIR_CONST, job.filename);
+
+  try {
+    await ensureLocal(filePath, job.filename);
+  } catch {
+    res.status(404).json({ error: "الملف غير موجود على الخادم." });
+    return;
+  }
+
+  const mimeTypes: Record<string, string> = {
+    jpg: "image/jpeg",
+    jpeg: "image/jpeg",
+    png: "image/png",
+    pdf: "application/pdf",
+    tif: "image/tiff",
+    tiff: "image/tiff",
+  };
+  const ext = job.filename.split(".").pop()?.toLowerCase() ?? "";
+  const contentType = mimeTypes[ext] ?? "application/octet-stream";
+
+  res.setHeader("Content-Type", contentType);
+  res.setHeader("Cache-Control", "private, max-age=3600");
+  createReadStream(filePath).pipe(res);
+});
+
+// ── Bulk Export as ZIP ────────────────────────────────────────────────────────
+
+router.post("/jobs/bulk-export", requireAuth, async (req, res): Promise<void> => {
+  const rawIds = req.body?.jobIds;
+  if (!Array.isArray(rawIds) || rawIds.length === 0 || rawIds.length > 50) {
+    res.status(400).json({ error: "يجب تحديد ما بين 1 و 50 مهمة للتصدير." });
+    return;
+  }
+
+  const jobIds: number[] = rawIds.map(Number).filter((n) => !isNaN(n) && n > 0);
+  if (jobIds.length === 0) {
+    res.status(400).json({ error: "معرّفات المهام غير صالحة." });
+    return;
+  }
+
+  // Fetch jobs with OCR results
+  const rows = await db
+    .select({
+      job: jobsTable,
+      result: ocrResultsTable,
+    })
+    .from(jobsTable)
+    .innerJoin(ocrResultsTable, eq(ocrResultsTable.jobId, jobsTable.id))
+    .where(inArray(jobsTable.id, jobIds));
+
+  if (rows.length === 0) {
+    res.status(404).json({ error: "لا توجد مهام بنتائج OCR للتصدير." });
+    return;
+  }
+
+  res.setHeader("Content-Type", "application/zip");
+  res.setHeader("Content-Disposition", `attachment; filename="ocr-export-${Date.now()}.zip"`);
+
+  const archive = archiver("zip", { zlib: { level: 6 } });
+  archive.pipe(res);
+
+  for (const { job, result } of rows) {
+    try {
+      const sourceFilePath = job.filename
+        ? join(UPLOADS_DIR_CONST, job.filename)
+        : undefined;
+      const docxBuffer = await generateDocx({
+        title: job.originalFilename,
+        filename: job.originalFilename,
+        text: result.refinedText,
+        confidenceScore: result.confidenceScore,
+        qualityLevel: result.qualityLevel,
+        processedAt: result.createdAt,
+        sourceFilePath,
+      });
+      const safeName = job.originalFilename.replace(/[^a-zA-Z0-9\u0600-\u06FF._-]/g, "_");
+      const entryName = `${job.id}_${safeName.replace(/\.[^.]+$/, "")}.docx`;
+      archive.append(docxBuffer, { name: entryName });
+    } catch {
+      // Skip files that fail to generate
+    }
+  }
+
+  await logAction(req, "BULK_EXPORT", "job", undefined, `Bulk export: ${rows.length} jobs`);
+
+  await archive.finalize();
+});
+
+export default router;
